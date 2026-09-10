@@ -1,3 +1,5 @@
+import json
+import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -90,6 +92,20 @@ class PreferencesFeatureDefaultsTests(unittest.TestCase):
             (config.pin_thumbnail_width, config.pin_thumbnail_height),
             (180, 120),
         )
+        self.assertEqual(config.translation_mode, "local")
+        self.assertEqual(config.translation_source, "auto")
+
+    def test_legacy_smart_translation_default_migrates_to_local(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "settings.json"
+            config_path.write_text(
+                json.dumps({"translation_mode": "smart"}),
+                encoding="utf-8",
+            )
+            with patch.object(app.ConfigStore, "CONFIG_FILE", config_path):
+                config = app.ConfigStore.load()
+
+        self.assertEqual(config.translation_mode, "local")
 
     def test_invalid_theme_color_falls_back_to_project_accent(self) -> None:
         self.assertEqual(

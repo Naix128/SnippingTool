@@ -39,6 +39,26 @@ from PIL import (
     ImageTk,
 )
 
+from screenshot_translation import (
+    LANGUAGE_LABELS,
+    ImageTranslationService,
+    LocalCTranslateProvider,
+    LocalModelManager,
+    TencentCredentialVault,
+    TencentTranslationProvider,
+    TranslationCredentials,
+    TranslationDocument,
+    TranslationError,
+    language_code_for_label,
+    language_label,
+)
+from screenshot_translation.dialog import (
+    ImageTranslationDialog,
+    TranslationCredentialDialog,
+)
+from screenshot_translation.ocr import RapidOcrAdapter, RapidOcrUnavailable
+from screenshot_translation.model_dialog import LocalModelManagerDialog
+
 Box = Tuple[int, int, int, int]
 Point = Tuple[int, int]
 
@@ -302,6 +322,7 @@ class OutputNamePolicy:
 class OcrWordResult:
     text: str
     box: Box
+    confidence: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -319,6 +340,11 @@ class OcrLineResult:
             max(word.box[2] for word in self.words),
             max(word.box[3] for word in self.words),
         )
+
+    @property
+    def confidence(self) -> Optional[float]:
+        values = [word.confidence for word in self.words if word.confidence is not None]
+        return sum(values) / len(values) if values else None
 
 
 @dataclass(frozen=True)
@@ -476,11 +502,11 @@ $path = [IO.Path]::GetFullPath($env:SCREENSHOT_OCR_IMAGE)
 $tag = if ($env:SCREENSHOT_OCR_LANGUAGE) { $env:SCREENSHOT_OCR_LANGUAGE } else { "zh-CN" }
 $language = [Windows.Globalization.Language]::new($tag)
 $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($language)
-if ($null -eq $engine) {
+if ($null -eq $engine -and $env:SCREENSHOT_OCR_STRICT_LANGUAGE -ne "1") {
     $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
 }
 if ($null -eq $engine) {
-    throw "No installed Windows OCR language is available."
+    throw "Windows OCR language is not installed: $tag"
 }
 $file = Await-WinRt ([Windows.Storage.StorageFile]::GetFileFromPathAsync($path)) ([Windows.Storage.StorageFile])
 $stream = Await-WinRt ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
@@ -511,9 +537,15 @@ $bitmap.Dispose()
 $stream.Dispose()
 '''
 
-    def __init__(self, language: str = "zh-CN", timeout_seconds: int = 60) -> None:
+    def __init__(
+        self,
+        language: str = "zh-CN",
+        timeout_seconds: int = 60,
+        strict_language: bool = False,
+    ) -> None:
         self.language = language
         self.timeout_seconds = max(5, int(timeout_seconds))
+        self.strict_language = bool(strict_language)
 
     def recognize(self, image: Image.Image) -> OcrDocument:
         if platform.system() != "Windows":
@@ -557,6 +589,9 @@ $stream.Dispose()
         environment = os.environ.copy()
         environment["SCREENSHOT_OCR_IMAGE"] = str(image_path.resolve())
         environment["SCREENSHOT_OCR_LANGUAGE"] = self.language
+        environment["SCREENSHOT_OCR_STRICT_LANGUAGE"] = (
+            "1" if self.strict_language else "0"
+        )
         completed = subprocess.run(
             [
                 "powershell.exe",
@@ -655,6 +690,76 @@ $stream.Dispose()
             lines.append(OcrLineResult(line_text, tuple(words)))
         text = "\n".join(line.text for line in lines)
         return OcrDocument(text, tuple(lines), source_size)
+
+
+class ConfigurableOcrBackend:
+    """Selects RapidOCR when requested and keeps Windows OCR as a fallback."""
+
+    WINDOWS_LANGUAGE_TAGS = {
+        "ar": "ar-SA", "az": "az-Latn-AZ", "bg": "bg-BG", "bn": "bn-BD",
+        "ca": "ca-ES", "cs": "cs-CZ", "da": "da-DK", "de": "de-DE",
+        "el": "el-GR", "en": "en-US", "es": "es-ES", "et": "et-EE",
+        "eu": "eu-ES", "fa": "fa-IR", "fi": "fi-FI", "fr": "fr-FR",
+        "ga": "ga-IE", "gl": "gl-ES", "he": "he-IL", "hi": "hi-IN",
+        "hu": "hu-HU", "id": "id-ID", "it": "it-IT", "ja": "ja-JP",
+        "ko": "ko-KR", "ky": "ky-KG", "lt": "lt-LT", "lv": "lv-LV",
+        "ms": "ms-MY", "nb": "nb-NO", "nl": "nl-NL", "pb": "pt-BR",
+        "pl": "pl-PL", "pt": "pt-PT", "ro": "ro-RO", "ru": "ru-RU",
+        "sk": "sk-SK", "sl": "sl-SI", "sq": "sq-AL", "sv": "sv-SE",
+        "sw": "sw-KE", "th": "th-TH", "tl": "fil-PH", "tr": "tr-TR",
+        "uk": "uk-UA", "ur": "ur-PK", "vi": "vi-VN", "zh": "zh-CN",
+        "zt": "zh-TW", "zh-TW": "zh-TW", "zh-HK": "zh-HK",
+    }
+
+    def __init__(self, engine: str = "auto", quality: str = "balanced") -> None:
+        self.engine = engine if engine in {"auto", "windows", "rapid"} else "auto"
+        self.windows = WindowsOcrBackend()
+        self.rapid = RapidOcrAdapter(quality)
+
+    def recognize(self, image: Image.Image) -> OcrDocument:
+        if self.engine == "windows":
+            return self.windows.recognize(image)
+        if self.engine == "rapid" and not self.rapid.is_available():
+            raise RapidOcrUnavailable(
+                "高精度 OCR 组件未安装，请安装 rapidocr 和 onnxruntime。"
+            )
+        if self.rapid.is_available():
+            try:
+                return self._to_document(image, self.rapid.recognize(image))
+            except Exception:
+                if self.engine == "rapid":
+                    raise
+        return self.windows.recognize(image)
+
+    def recognize_for_language(
+        self,
+        image: Image.Image,
+        language: str = "auto",
+    ) -> OcrDocument:
+        code = str(language or "auto")
+        if code in {"auto", "en", "zh"}:
+            return self.recognize(image)
+        tag = self.WINDOWS_LANGUAGE_TAGS.get(code)
+        if not tag:
+            return self.recognize(image)
+        return WindowsOcrBackend(tag, strict_language=True).recognize(image)
+
+    @staticmethod
+    def _to_document(image: Image.Image, detected_lines: object) -> OcrDocument:
+        lines: list[OcrLineResult] = []
+        for detected in detected_lines or ():
+            left, top, right, bottom = detected.box
+            word = OcrWordResult(
+                detected.text,
+                (left, top, right, bottom),
+                detected.confidence,
+            )
+            lines.append(OcrLineResult(detected.text, (word,)))
+        return OcrDocument(
+            "\n".join(line.text for line in lines),
+            tuple(lines),
+            image.size,
+        )
 
 
 class ScreenshotManager:
@@ -1973,6 +2078,12 @@ class ToolbarIconFactory:
             cls._draw_undo(draw, size, color, s, reverse=True)
         elif icon == "cancel":
             cls._draw_cancel(draw, red, s)
+        elif icon == "translate":
+            line([(4, 18), (8.5, 5), (13, 18)])
+            line([(6, 13), (11, 13)], width=1.3)
+            line([(14.5, 7), (20, 7)], width=1.2)
+            line([(17.2, 5), (17.2, 16)], width=1.2)
+            line([(14.5, 11), (17.2, 16), (20, 11)], width=1.2)
         elif icon == "pin":
             cls._draw_pin(draw, color, s)
         elif icon == "copy":
@@ -2173,6 +2284,7 @@ class FloatingToolbar:
         ToolbarItem("undo", "撤销"),
         ToolbarItem("redo", "重做"),
         ToolbarItem("cancel", "取消"),
+        ToolbarItem("translate", "翻译图片"),
         ToolbarItem("pin", "贴到屏幕"),
         ToolbarItem("save", "保存"),
         ToolbarItem("copy", "复制到剪贴板"),
@@ -3536,7 +3648,7 @@ class CaptureOverlay:
             self._cancel()
             return
 
-        if command in {"pin", "copy", "save", "finish"}:
+        if command in {"pin", "copy", "save", "finish", "translate"}:
             self._finish(command)
 
     def _begin_transform(self, mode: str, x: int, y: int) -> None:
@@ -6109,6 +6221,8 @@ HOTKEY_ACTIONS = (
     HotkeyActionDefinition("save_as", "当前图片另存为", "Ctrl+S", False),
     HotkeyActionDefinition("copy_current", "复制当前图片", "Ctrl+C", False),
     HotkeyActionDefinition("ocr_current", "提取当前图片文字", "Ctrl+Shift+O", False),
+    HotkeyActionDefinition("translate_region", "框选并翻译", ""),
+    HotkeyActionDefinition("translate_current", "翻译当前图片", "", False),
 )
 
 
@@ -6406,6 +6520,15 @@ class PersistedAppConfig:
     pin_max_size: int = 12000
     pin_thumbnail_width: int = 180
     pin_thumbnail_height: int = 120
+    translation_mode: str = "local"
+    translation_source: str = "auto"
+    translation_target: str = "zh"
+    translation_region: str = "ap-guangzhou"
+    translation_quality_mode: int = 0
+    translation_confirm_upload: bool = True
+    translation_cache_size: int = 6
+    ocr_engine: str = "auto"
+    ocr_quality: str = "balanced"
     hotkeys: dict[str, str] = field(default_factory=default_hotkey_map)
 
 
@@ -6495,6 +6618,31 @@ class ConfigStore:
         config.pin_thumbnail_height = cls._clamp_int(
             config.pin_thumbnail_height, 40, 600, 120
         )
+        if config.translation_mode == "smart":
+            config.translation_mode = "local"
+        elif config.translation_mode not in {
+            "local",
+            "tencent_smart",
+            "cloud",
+            "privacy",
+        }:
+            config.translation_mode = "local"
+        if config.translation_source != "auto" and config.translation_source not in LANGUAGE_LABELS:
+            config.translation_source = "auto"
+        if config.translation_target not in LANGUAGE_LABELS:
+            config.translation_target = "zh"
+        if not re.fullmatch(r"[a-z]{2}(?:-[a-z]+)?", str(config.translation_region)):
+            config.translation_region = "ap-guangzhou"
+        config.translation_quality_mode = cls._clamp_int(
+            config.translation_quality_mode, 0, 1, 0
+        )
+        config.translation_cache_size = cls._clamp_int(
+            config.translation_cache_size, 0, 20, 6
+        )
+        if config.ocr_engine not in {"auto", "windows", "rapid"}:
+            config.ocr_engine = "auto"
+        if config.ocr_quality not in {"balanced", "accurate"}:
+            config.ocr_quality = "balanced"
         config.filename_pattern = str(config.filename_pattern or OutputNamePolicy.DEFAULT_PATTERN)
         config.quick_filename_pattern = str(
             config.quick_filename_pattern or OutputNamePolicy.DEFAULT_QUICK_PATTERN
@@ -7456,6 +7604,7 @@ class PinnedImageWindow:
         copy_func: Callable[[Image.Image], None],
         save_func: Callable[[Image.Image], Path],
         ocr_func: Optional[Callable[[Image.Image], None]] = None,
+        translate_func: Optional[Callable[[Image.Image], None]] = None,
         title: str = "贴图",
         position: Optional[Point] = None,
         snap_targets_func: Optional[Callable[["PinnedImageWindow"], List[Box]]] = None,
@@ -7471,6 +7620,7 @@ class PinnedImageWindow:
         self.copy_func = copy_func
         self.save_func = save_func
         self.ocr_func = ocr_func
+        self.translation_func = translate_func
         self.title = title
         self.position = position
         self.snap_targets_func = snap_targets_func
@@ -7527,6 +7677,8 @@ class PinnedImageWindow:
         self.menu.add_command(label="保存图像", command=self.save)
         if self.ocr_func:
             self.menu.add_command(label="提取文字", command=self.extract_text)
+        if self.translation_func:
+            self.menu.add_command(label="翻译图片", command=self.translate_image)
         self.menu.add_separator()
         self.menu.add_command(label="顺时针旋转 90 度", command=lambda: self.rotate(-90))
         self.menu.add_command(label="逆时针旋转 90 度", command=lambda: self.rotate(90))
@@ -7860,6 +8012,12 @@ class PinnedImageWindow:
             self._dismiss_context_menu()
             self.root.after_idle(lambda: self.ocr_func(image))
 
+    def translate_image(self) -> None:
+        if self.translation_func:
+            image = self.current_image()
+            self._dismiss_context_menu()
+            self.root.after_idle(lambda: self.translation_func(image))
+
     def current_image(self) -> Image.Image:
         image = self.image.copy()
         if self.grayscale:
@@ -7962,6 +8120,7 @@ class PinManager:
         max_window_size: int = 12000,
         thumbnail_size: Tuple[int, int] = (180, 120),
         ocr_func: Optional[Callable[[Image.Image], None]] = None,
+        translate_func: Optional[Callable[[Image.Image], None]] = None,
     ) -> None:
         self.root = root
         self.copy_func = copy_func
@@ -7976,6 +8135,7 @@ class PinManager:
             max(40, min(600, int(thumbnail_size[1]))),
         )
         self.ocr_func = ocr_func
+        self.translation_func = translate_func
         self.windows: List[PinnedImageWindow] = []
         self.closed_images: List[Image.Image] = []
         self.hidden = False
@@ -7993,6 +8153,7 @@ class PinManager:
             copy_func=self.copy_func,
             save_func=self.save_func,
             ocr_func=self.ocr_func,
+            translate_func=self.translation_func,
             title=title,
             position=position,
             snap_targets_func=self._snap_targets,
@@ -8257,6 +8418,7 @@ class ColorPickerOverlay:
 class OcrResultDialog(tk.Toplevel):
     """展示原图与 OCR 坐标，并支持从图片或文本区复制。"""
 
+    LOW_CONFIDENCE_THRESHOLD = 0.65
     WIDTH = 1100
     HEIGHT = 700
     MIN_WIDTH = 820
@@ -8273,6 +8435,7 @@ class OcrResultDialog(tk.Toplevel):
         title: str = "图片文字",
         on_close: Optional[Callable[[], None]] = None,
         status_func: Optional[Callable[[str], None]] = None,
+        translate_func: Optional[Callable[[Image.Image], None]] = None,
     ) -> None:
         super().__init__(parent)
         self.parent = parent
@@ -8280,6 +8443,7 @@ class OcrResultDialog(tk.Toplevel):
         self.backend = backend or WindowsOcrBackend()
         self.on_close_callback = on_close
         self.status_func = status_func
+        self.translate_func = translate_func
         self.document: Optional[OcrDocument] = None
         self.selection_model: Optional[OcrSelectionModel] = None
         self.selected_words: set[Tuple[int, int]] = set()
@@ -8292,10 +8456,13 @@ class OcrResultDialog(tk.Toplevel):
         self.photo: Optional[ImageTk.PhotoImage] = None
         self.render_job: Optional[str] = None
         self.poll_job: Optional[str] = None
+        self.recognition_job: Optional[str] = None
+        self.sash_job: Optional[str] = None
         self.result_queue: queue.SimpleQueue[Tuple[int, str, object]] = queue.SimpleQueue()
         self.recognition_generation = 0
         self.closed = False
         self.line_tags: List[str] = []
+        self.text_context_index = "1.0"
 
         self.title(f"提取文字 - {title}")
         self.configure(bg="#F3F5F7")
@@ -8306,9 +8473,9 @@ class OcrResultDialog(tk.Toplevel):
         self._center_at_pointer()
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.bind("<Escape>", lambda event: self.close())
-        self.after(60, self._start_recognition)
-        self.after(80, self._render_image)
-        self.after(120, self._set_initial_sash)
+        self.recognition_job = self.after(60, self._start_recognition)
+        self.render_job = self.after(80, self._render_image)
+        self.sash_job = self.after(120, self._set_initial_sash)
         self.lift()
         self.focus_force()
 
@@ -8329,6 +8496,10 @@ class OcrResultDialog(tk.Toplevel):
             command=self._start_recognition,
         )
         self.recognize_button.pack(side=tk.RIGHT)
+        if self.translate_func:
+            ttk.Button(header, text="翻译图片", command=self._translate_image).pack(
+                side=tk.RIGHT, padx=(0, 8)
+            )
         ttk.Label(
             header,
             textvariable=self.status_var,
@@ -8472,8 +8643,20 @@ class OcrResultDialog(tk.Toplevel):
         text_scroll.grid(row=0, column=1, sticky=tk.NS)
         self.text.tag_configure("ocr_image_selection", background=self.ACCENT_SOFT)
         self.text.bind("<Control-a>", self._select_all_text)
+        self.text.bind("<Control-c>", self._copy_text_selection)
+        self.text_menu = tk.Menu(self.text, tearoff=False)
+        self.text_menu.add_command(label="复制", command=self._copy_text_selection)
+        self.text_menu.add_command(
+            label="复制当前行",
+            command=self._copy_context_line,
+        )
+        self.text_menu.add_command(label="复制全部", command=self._copy_all)
+        self.text_menu.add_separator()
+        self.text_menu.add_command(label="全选", command=self._select_all_text)
+        self.text.bind("<Button-3>", self._show_text_menu)
 
     def _start_recognition(self) -> None:
+        self.recognition_job = None
         if self.closed:
             return
         self.recognition_generation += 1
@@ -8544,8 +8727,20 @@ class OcrResultDialog(tk.Toplevel):
             if index < len(document.lines) - 1:
                 self.text.insert(tk.END, "\n")
         if document.lines:
+            low_confidence_count = sum(
+                1
+                for line in document.lines
+                if line.confidence is not None
+                and line.confidence < self.LOW_CONFIDENCE_THRESHOLD
+            )
+            confidence_hint = (
+                f" · {low_confidence_count} 行需检查"
+                if low_confidence_count
+                else ""
+            )
             self.status_var.set(
-                f"已识别 {len(document.lines)} 行 · {document.word_count} 个文字块"
+                f"已识别 {len(document.lines)} 行 · "
+                f"{document.word_count} 个文字块{confidence_hint}"
             )
             self.copy_selected_button.configure(state="normal")
             self.copy_all_button.configure(state="normal")
@@ -8632,9 +8827,16 @@ class OcrResultDialog(tk.Toplevel):
             return
         for line_index, line in enumerate(self.document.lines):
             line_box = self._canvas_box(line.box)
+            low_confidence = (
+                line.confidence is not None
+                and line.confidence < self.LOW_CONFIDENCE_THRESHOLD
+            )
+            outline = "#E58A00" if low_confidence else "#19A7CE"
+            if line_index == self.hovered_line:
+                outline = "#00C8F0"
             self.canvas.create_rectangle(
                 line_box,
-                outline="#19A7CE" if line_index != self.hovered_line else "#00C8F0",
+                outline=outline,
                 width=2 if line_index == self.hovered_line else 1,
                 tags=("ocr_overlay",),
             )
@@ -8740,6 +8942,7 @@ class OcrResultDialog(tk.Toplevel):
         self._render_image()
 
     def _set_initial_sash(self) -> None:
+        self.sash_job = None
         if self.closed:
             return
         try:
@@ -8782,6 +8985,21 @@ class OcrResultDialog(tk.Toplevel):
                 text = self.selection_model.text_for(self.selected_words)
         return self._copy_text(text, "已复制选中文字")
 
+    def _copy_text_selection(self, event: Optional[tk.Event] = None) -> str:
+        try:
+            text = self.text.get(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            text = ""
+        return self._copy_text(text, "已复制选中文字")
+
+    def _copy_context_line(self) -> str:
+        start = self.text.index(f"{self.text_context_index} linestart")
+        end = self.text.index(f"{self.text_context_index} lineend")
+        return self._copy_text(
+            self.text.get(start, end),
+            "已复制当前行",
+        )
+
     def _copy_all(self) -> str:
         return self._copy_text(
             self.text.get("1.0", tk.END + "-1c"),
@@ -8801,12 +9019,39 @@ class OcrResultDialog(tk.Toplevel):
             self.status_func(message)
         return "break"
 
+    def _translate_image(self) -> None:
+        if not self.translate_func:
+            return
+        image = self.image.copy()
+        self.close()
+        self.translate_func(image)
+
     def _show_image_menu(self, event: tk.Event) -> str:
         try:
             self.image_menu.tk_popup(event.x_root, event.y_root)
         finally:
             try:
                 self.image_menu.grab_release()
+            except tk.TclError:
+                pass
+        return "break"
+
+    def _show_text_menu(self, event: tk.Event) -> str:
+        self.text.focus_set()
+        self.text_context_index = self.text.index(f"@{event.x},{event.y}")
+        try:
+            has_selection = bool(self.text.get(tk.SEL_FIRST, tk.SEL_LAST))
+        except tk.TclError:
+            has_selection = False
+        self.text_menu.entryconfigure(
+            "复制",
+            state="normal" if has_selection else "disabled",
+        )
+        try:
+            self.text_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                self.text_menu.grab_release()
             except tk.TclError:
                 pass
         return "break"
@@ -8859,12 +9104,21 @@ class OcrResultDialog(tk.Toplevel):
         if self.closed:
             return
         self.closed = True
-        if self.poll_job:
-            try:
-                self.after_cancel(self.poll_job)
-            except tk.TclError:
-                pass
-            self.poll_job = None
+        for job in (
+            self.poll_job,
+            self.render_job,
+            self.recognition_job,
+            self.sash_job,
+        ):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except tk.TclError:
+                    pass
+        self.poll_job = None
+        self.render_job = None
+        self.recognition_job = None
+        self.sash_job = None
         self.destroy()
         if self.on_close_callback:
             self.on_close_callback()
@@ -8882,6 +9136,7 @@ class HistoryDialog(tk.Toplevel):
         on_copy: Callable[[Image.Image], None],
         on_clear: Callable[[], None],
         on_ocr: Optional[Callable[[Image.Image], None]] = None,
+        on_translate: Optional[Callable[[Image.Image], None]] = None,
     ) -> None:
         super().__init__(parent)
         self.title("截图历史")
@@ -8893,6 +9148,7 @@ class HistoryDialog(tk.Toplevel):
         self.on_copy = on_copy
         self.on_clear = on_clear
         self.on_ocr = on_ocr
+        self.on_translate = on_translate
         self.preview_photo: Optional[ImageTk.PhotoImage] = None
 
         body = ttk.Frame(self, padding=12)
@@ -8918,6 +9174,8 @@ class HistoryDialog(tk.Toplevel):
                 side=tk.LEFT,
                 padx=(0, 8),
             )
+        if self.on_translate:
+            ttk.Button(buttons, text="翻译图片", command=self._translate).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(buttons, text="清空历史", command=self._clear).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(buttons, text="关闭", command=self.destroy).pack(side=tk.LEFT)
 
@@ -8986,6 +9244,11 @@ class HistoryDialog(tk.Toplevel):
         image = self._selected_image()
         if image and self.on_ocr:
             self.on_ocr(image)
+
+    def _translate(self) -> None:
+        image = self._selected_image()
+        if image and self.on_translate:
+            self.on_translate(image)
 
     def _clear(self) -> None:
         if messagebox.askyesno("确认", "确定清空所有截图历史吗？", parent=self):
@@ -9159,6 +9422,9 @@ class PreferencesDialog(tk.Toplevel):
         config: PersistedAppConfig,
         hotkey_status: str = "",
         hotkey_registration: Optional[dict[str, str]] = None,
+        translation_vault: Optional[TencentCredentialVault] = None,
+        local_model_manager: Optional[LocalModelManager] = None,
+        local_models_changed_func: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(parent)
         self.title("ScreenshotTool 首选项")
@@ -9174,6 +9440,10 @@ class PreferencesDialog(tk.Toplevel):
         )
         self.iconphoto(False, self.window_icon)
         self.hotkey_registration = dict(hotkey_registration or {})
+        self.translation_vault = translation_vault or TencentCredentialVault()
+        self.local_model_manager = local_model_manager or LocalModelManager()
+        self.local_models_changed_func = local_models_changed_func
+        self.local_model_dialog: Optional[LocalModelManagerDialog] = None
         self._configure_preferences_styles(config.accent_color)
 
         self._create_variables(config)
@@ -9202,7 +9472,7 @@ class PreferencesDialog(tk.Toplevel):
         self.notebook = ttk.Notebook(shell, style="Prefs.TNotebook")
 
         self.tabs: dict[str, ttk.Frame] = {}
-        for label in ("常规", "界面", "截图", "贴图", "输出", "控制", "关于"):
+        for label in ("常规", "界面", "截图", "贴图", "输出", "翻译", "控制", "关于"):
             tab = ttk.Frame(
                 self.notebook,
                 style="PrefsPage.TFrame",
@@ -9216,6 +9486,7 @@ class PreferencesDialog(tk.Toplevel):
         self._build_capture_tab(self.tabs["截图"])
         self._build_pin_tab(self.tabs["贴图"])
         self._build_output_tab(self.tabs["输出"])
+        self._build_translation_tab(self.tabs["翻译"])
         self._build_control_tab(self.tabs["控制"])
         self._build_about_tab(self.tabs["关于"])
 
@@ -9314,10 +9585,25 @@ class PreferencesDialog(tk.Toplevel):
         self.pin_max_size_var = tk.IntVar(value=config.pin_max_size)
         self.pin_thumbnail_width_var = tk.IntVar(value=config.pin_thumbnail_width)
         self.pin_thumbnail_height_var = tk.IntVar(value=config.pin_thumbnail_height)
+        self.translation_mode_var = tk.StringVar(value=config.translation_mode)
+        self.translation_source_var = tk.StringVar(
+            value=language_label(config.translation_source)
+        )
+        self.translation_target_var = tk.StringVar(value=language_label(config.translation_target))
+        self.translation_region_var = tk.StringVar(value=config.translation_region)
+        self.translation_quality_var = tk.IntVar(value=config.translation_quality_mode)
+        self.translation_confirm_var = tk.BooleanVar(value=config.translation_confirm_upload)
+        self.translation_cache_var = tk.IntVar(value=config.translation_cache_size)
+        self.ocr_engine_var = tk.StringVar(value=config.ocr_engine)
+        self.ocr_quality_var = tk.StringVar(value=config.ocr_quality)
+        self.translation_credential_status_var = tk.StringVar(value="")
+        self.translation_local_status_var = tk.StringVar(value="")
         self.config_path_var = tk.StringVar(value=str(ConfigStore.CONFIG_FILE.resolve()))
         self.hotkey_values = HotkeyCodec.merge_with_defaults(config.hotkeys)
         self.original_hotkey_values = dict(self.hotkey_values)
         self.hotkey_status_var = tk.StringVar(value="")
+        self._refresh_translation_credential_status()
+        self._refresh_local_translation_status()
         self._update_opacity_label()
         self._update_mask_opacity_label()
         self._update_magnifier_zoom_label()
@@ -10002,6 +10288,258 @@ class PreferencesDialog(tk.Toplevel):
         self._path_row(paths, 1, "快捷保存", self.quick_var)
         self._path_row(paths, 2, "历史目录", self.history_var)
 
+    def _build_translation_tab(self, tab: ttk.Frame) -> None:
+        pages = self._subtabs(tab, ("常规", "文字识别"))
+        self._build_translation_general(pages["常规"])
+        self._build_translation_ocr(pages["文字识别"])
+
+    def _refresh_translation_credential_status(self) -> None:
+        try:
+            value = self.translation_vault.status_text()
+        except Exception:
+            value = "读取失败"
+        self.translation_credential_status_var.set(value)
+
+    def _refresh_local_translation_status(self) -> None:
+        runtime = (
+            "运行组件可用"
+            if LocalCTranslateProvider.is_available()
+            else "运行组件未安装"
+        )
+        self.translation_local_status_var.set(
+            f"{runtime} · {self.local_model_manager.status_text()}"
+        )
+
+    def _open_local_translation_directory(self) -> None:
+        try:
+            self.local_model_manager.root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("模型目录不可用", str(exc), parent=self)
+            return
+        self._open_path(self.local_model_manager.root.resolve())
+
+    def _open_local_model_manager(self) -> None:
+        if self.local_model_dialog and self.local_model_dialog.winfo_exists():
+            self.local_model_dialog.deiconify()
+            self.local_model_dialog.lift()
+            self.local_model_dialog.focus_force()
+            return
+        self.local_model_dialog = LocalModelManagerDialog(
+            self,
+            self.local_model_manager,
+            self._open_local_translation_directory,
+            on_change=self._on_local_models_changed,
+            on_close=self._on_local_model_dialog_close,
+        )
+
+    def _on_local_model_dialog_close(self) -> None:
+        self.local_model_dialog = None
+
+    def _on_local_models_changed(self) -> None:
+        self._refresh_local_translation_status()
+        if self.local_models_changed_func:
+            self.local_models_changed_func()
+
+    def _close_local_model_dialog(self) -> None:
+        if self.local_model_dialog and self.local_model_dialog.winfo_exists():
+            self.local_model_dialog.close()
+        self.local_model_dialog = None
+
+    def _configure_translation_credentials(self) -> None:
+        try:
+            current = self.translation_vault.load()
+            result = TranslationCredentialDialog.ask(self, current)
+            if result is False:
+                self.translation_vault.clear()
+            elif isinstance(result, TranslationCredentials):
+                self.translation_vault.save(result)
+            self._refresh_translation_credential_status()
+        except Exception as exc:
+            messagebox.showerror("密钥设置失败", str(exc), parent=self)
+
+    def _build_translation_general(self, tab: ttk.Frame) -> None:
+        mode = self._section(tab, "翻译方式")
+        choices = (
+            ("local", "本地离线（免费）"),
+            ("tencent_smart", "腾讯同版式（智能回退）"),
+            ("cloud", "腾讯同版式"),
+            ("privacy", "腾讯仅上传文字"),
+        )
+        for index, (value, label) in enumerate(choices):
+            ttk.Radiobutton(
+                mode,
+                text=label,
+                value=value,
+                variable=self.translation_mode_var,
+                style="Prefs.TRadiobutton",
+            ).grid(
+                row=index // 2,
+                column=index % 2,
+                sticky=tk.W,
+                padx=(0, 30),
+                pady=2,
+            )
+        language_row = ttk.Frame(mode, style="PrefsSection.TFrame")
+        language_row.grid(
+            row=2,
+            column=0,
+            columnspan=3,
+            sticky=tk.W,
+            pady=(10, 2),
+        )
+        ttk.Label(language_row, text="源语言", style="Prefs.TLabel").pack(side=tk.LEFT)
+        ttk.Combobox(
+            language_row,
+            textvariable=self.translation_source_var,
+            values=("自动检测", *LANGUAGE_LABELS.values()),
+            state="readonly",
+            width=17,
+        ).pack(side=tk.LEFT, padx=(10, 7))
+        ttk.Label(language_row, text="→", style="PrefsMuted.TLabel").pack(side=tk.LEFT)
+        ttk.Label(language_row, text="目标语言", style="Prefs.TLabel").pack(
+            side=tk.LEFT,
+            padx=(7, 0),
+        )
+        ttk.Combobox(
+            language_row,
+            textvariable=self.translation_target_var,
+            values=tuple(LANGUAGE_LABELS.values()),
+            state="readonly",
+            width=17,
+        ).pack(side=tk.LEFT, padx=(10, 0))
+        cache = ttk.Frame(language_row, style="PrefsSection.TFrame")
+        cache.pack(side=tk.LEFT, padx=(24, 0))
+        ttk.Label(cache, text="结果缓存", style="Prefs.TLabel").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            cache,
+            from_=0,
+            to=20,
+            textvariable=self.translation_cache_var,
+            width=5,
+            justify=tk.CENTER,
+        ).pack(side=tk.LEFT, padx=(8, 5))
+        ttk.Label(cache, text="项", style="PrefsMuted.TLabel").pack(side=tk.LEFT)
+
+        details = ttk.Frame(tab, style="PrefsPage.TFrame")
+        details.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
+        details.columnconfigure(0, weight=1, uniform="translation")
+        details.columnconfigure(1, weight=1, uniform="translation")
+        local_column = ttk.Frame(details, style="PrefsPage.TFrame")
+        cloud_column = ttk.Frame(details, style="PrefsPage.TFrame")
+        local_column.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 14))
+        cloud_column.grid(row=0, column=1, sticky=tk.NSEW, padx=(14, 0))
+
+        local = self._section(local_column, "本地离线翻译")
+        local.columnconfigure(0, weight=1)
+        ttk.Label(
+            local,
+            textvariable=self.translation_local_status_var,
+            style="PrefsValue.TLabel",
+            wraplength=300,
+        ).grid(row=0, column=0, sticky=tk.W, pady=3)
+        local_actions = ttk.Frame(local, style="PrefsSection.TFrame")
+        local_actions.grid(row=1, column=0, sticky=tk.W, pady=(7, 3))
+        ttk.Button(
+            local_actions,
+            text="管理 / 下载模型",
+            style="Prefs.TButton",
+            command=self._open_local_model_manager,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            local_actions,
+            text="打开目录",
+            style="Prefs.TButton",
+            command=self._open_local_translation_directory,
+        ).pack(side=tk.LEFT, padx=(7, 0))
+        ttk.Label(
+            local,
+            text="提供 50 种语言与 100 个模型；支持多选下载和英语中转。",
+            style="PrefsMuted.TLabel",
+            wraplength=310,
+        ).grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
+
+        cloud = self._section(cloud_column, "腾讯云（可选）")
+        cloud.columnconfigure(1, weight=1)
+        ttk.Label(cloud, text="腾讯云密钥", style="Prefs.TLabel").grid(
+            row=0, column=0, sticky=tk.W, pady=3
+        )
+        ttk.Label(
+            cloud,
+            textvariable=self.translation_credential_status_var,
+            style="PrefsMuted.TLabel",
+        ).grid(row=0, column=1, sticky=tk.W, padx=(12, 0), pady=3)
+        ttk.Button(
+            cloud,
+            text="配置密钥",
+            style="Prefs.TButton",
+            command=self._configure_translation_credentials,
+        ).grid(row=0, column=2, sticky=tk.E, padx=(6, 0), pady=3)
+        ttk.Label(cloud, text="服务地域", style="Prefs.TLabel").grid(
+            row=1, column=0, sticky=tk.W, pady=3
+        )
+        ttk.Entry(cloud, textvariable=self.translation_region_var, width=20).grid(
+            row=1, column=1, columnspan=2, sticky=tk.W, padx=(12, 0), pady=3
+        )
+        quality = ttk.Frame(cloud, style="PrefsSection.TFrame")
+        quality.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=3)
+        ttk.Label(quality, text="图片模型", style="Prefs.TLabel").pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            quality,
+            text="Pro",
+            value=0,
+            variable=self.translation_quality_var,
+            style="Prefs.TRadiobutton",
+        ).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Radiobutton(
+            quality,
+            text="Lite",
+            value=1,
+            variable=self.translation_quality_var,
+            style="Prefs.TRadiobutton",
+        ).pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Checkbutton(
+            cloud,
+            text="云端图片翻译前确认上传",
+            variable=self.translation_confirm_var,
+            style="Prefs.TCheckbutton",
+        ).grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
+
+    def _build_translation_ocr(self, tab: ttk.Frame) -> None:
+        engine = self._section(tab, "OCR 引擎")
+        for column, (value, label) in enumerate((
+            ("auto", "自动"),
+            ("windows", "Windows OCR"),
+            ("rapid", "RapidOCR"),
+        )):
+            ttk.Radiobutton(
+                engine,
+                text=label,
+                value=value,
+                variable=self.ocr_engine_var,
+                style="Prefs.TRadiobutton",
+            ).grid(row=0, column=column, sticky=tk.W, padx=(0, 22))
+        ttk.Label(
+            engine,
+            text="RapidOCR 已安装" if RapidOcrAdapter.is_available() else "RapidOCR 未安装",
+            style="PrefsMuted.TLabel",
+        ).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
+
+        quality = self._section(tab, "识别精度", top_padding=18)
+        ttk.Radiobutton(
+            quality,
+            text="均衡",
+            value="balanced",
+            variable=self.ocr_quality_var,
+            style="Prefs.TRadiobutton",
+        ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            quality,
+            text="高",
+            value="accurate",
+            variable=self.ocr_quality_var,
+            style="Prefs.TRadiobutton",
+        ).pack(side=tk.LEFT, padx=(20, 0))
+
     def _build_control_tab(self, tab: ttk.Frame) -> None:
         top = ttk.Frame(tab, style="PrefsPage.TFrame")
         top.pack(fill=tk.X, pady=(0, 9))
@@ -10198,7 +10736,7 @@ class PreferencesDialog(tk.Toplevel):
         ttk.Label(details, text="版本", style="Prefs.TLabel").grid(
             row=0, column=0, sticky=tk.W, pady=5
         )
-        ttk.Label(details, text="1.2.0", style="PrefsValue.TLabel").grid(
+        ttk.Label(details, text="1.5.0", style="PrefsValue.TLabel").grid(
             row=0, column=1, sticky=tk.W, padx=(30, 0), pady=5
         )
         ttk.Label(details, text="运行环境", style="Prefs.TLabel").grid(
@@ -10444,6 +10982,15 @@ class PreferencesDialog(tk.Toplevel):
         self.pin_max_size_var.set(config.pin_max_size)
         self.pin_thumbnail_width_var.set(config.pin_thumbnail_width)
         self.pin_thumbnail_height_var.set(config.pin_thumbnail_height)
+        self.translation_mode_var.set(config.translation_mode)
+        self.translation_source_var.set(language_label(config.translation_source))
+        self.translation_target_var.set(language_label(config.translation_target))
+        self.translation_region_var.set(config.translation_region)
+        self.translation_quality_var.set(config.translation_quality_mode)
+        self.translation_confirm_var.set(config.translation_confirm_upload)
+        self.translation_cache_var.set(config.translation_cache_size)
+        self.ocr_engine_var.set(config.ocr_engine)
+        self.ocr_quality_var.set(config.ocr_quality)
         self.hotkey_values = HotkeyCodec.merge_with_defaults(config.hotkeys)
         self.hotkey_status_var.set("已恢复默认设置")
         self._refresh_hotkey_table()
@@ -10542,12 +11089,26 @@ class PreferencesDialog(tk.Toplevel):
             pin_max_size=pin_max_size,
             pin_thumbnail_width=pin_thumbnail_width,
             pin_thumbnail_height=pin_thumbnail_height,
+            translation_mode=self.translation_mode_var.get(),
+            translation_source=language_code_for_label(
+                self.translation_source_var.get(),
+                fallback="auto",
+            ),
+            translation_target=language_code_for_label(self.translation_target_var.get()),
+            translation_region=self.translation_region_var.get().strip() or "ap-guangzhou",
+            translation_quality_mode=int(self.translation_quality_var.get()),
+            translation_confirm_upload=bool(self.translation_confirm_var.get()),
+            translation_cache_size=int(self.translation_cache_var.get()),
+            ocr_engine=self.ocr_engine_var.get(),
+            ocr_quality=self.ocr_quality_var.get(),
             hotkeys=hotkeys,
         )
+        self._close_local_model_dialog()
         self.destroy()
 
     def _cancel(self) -> None:
         self.result = None
+        self._close_local_model_dialog()
         self.destroy()
 
     def _center(self, parent: tk.Tk) -> None:
@@ -10604,8 +11165,19 @@ class ScreenshotApp:
         self.long_controller: Optional[LongScreenshotController] = None
         self.long_result_dialog: Optional[LongScreenshotResultDialog] = None
         self.pending_long_output: Optional[LongCaptureOutput] = None
-        self.ocr_backend = WindowsOcrBackend()
+        self.ocr_backend = ConfigurableOcrBackend(
+            self.app_config.ocr_engine,
+            self.app_config.ocr_quality,
+        )
         self.ocr_dialog: Optional[OcrResultDialog] = None
+
+        self.translation_vault = TencentCredentialVault()
+        self.local_model_manager = LocalModelManager()
+        self.translation_service: Optional[ImageTranslationService] = None
+        self.local_translation_service: Optional[ImageTranslationService] = None
+        self.translation_dialog: Optional[ImageTranslationDialog] = None
+        self.translation_upload_confirmed = False
+        self.translation_model_download_confirmed: set[tuple[str, str]] = set()
         self.preferences_dialog: Optional[PreferencesDialog] = None
         self.preferences_hidden_for_capture = False
         self.global_hotkey_manager: Optional[WindowsGlobalHotkeyManager] = None
@@ -10629,6 +11201,7 @@ class ScreenshotApp:
                 self.app_config.pin_thumbnail_height,
             ),
             ocr_func=self.extract_text_from_image,
+            translate_func=self.translate_image,
         )
 
         self.auto_save_var = tk.BooleanVar(value=self.settings.auto_save)
@@ -10822,9 +11395,10 @@ class ScreenshotApp:
                 ("贴到屏幕", self.pin_last_image),
                 ("快捷保存", self.quick_save_last_image),
                 ("提取文字", self.extract_text_from_current),
+                ("翻译图片", self.translate_current_image),
             )
         ):
-            is_full_width = index == 4
+            is_full_width = False
             ttk.Button(current_actions, text=label, command=command).grid(
                 row=index // 2,
                 column=index % 2,
@@ -10943,6 +11517,8 @@ class ScreenshotApp:
             "save_as": self.save_as,
             "copy_current": self.copy_last_image,
             "ocr_current": self.extract_text_from_current,
+            "translate_region": self.capture_translation_region,
+            "translate_current": self.translate_current_image,
         }
 
     def _configure_global_hotkeys(self) -> None:
@@ -11129,6 +11705,9 @@ class ScreenshotApp:
     def capture_region(self) -> None:
         self._run_capture_after_delay(self._start_region_capture)
 
+    def capture_translation_region(self) -> None:
+        self._run_capture_after_delay(self._start_translation_region_capture)
+
     def capture_long_screenshot(self) -> None:
         if self.long_controller and self.long_controller.running:
             self.long_controller.stop()
@@ -11190,10 +11769,155 @@ class ScreenshotApp:
             title=title,
             on_close=self._on_ocr_dialog_close,
             status_func=self._set_status,
+            translate_func=lambda value: self.translate_image(value, title),
         )
 
     def _on_ocr_dialog_close(self) -> None:
         self.ocr_dialog = None
+
+    def translate_current_image(self) -> None:
+        if self.last_image is None:
+            self._show_warning("请先截图或从历史加载图片，再翻译。")
+            return
+        self.translate_image(self.last_image, "当前图片")
+
+    def translate_image(self, image: Image.Image, title: str = "图片翻译") -> None:
+        if self.translation_dialog and self.translation_dialog.winfo_exists():
+            self.translation_dialog.close()
+        self._set_status("正在准备图片翻译...")
+        self.translation_dialog = self._create_translation_dialog(image, title)
+
+    def _ensure_translation_credentials(self, parent=None) -> bool:
+        current = self.translation_vault.load()
+        if current:
+            return True
+        return self._edit_translation_credentials(parent or self.root)
+
+    def _edit_translation_credentials(self, parent=None) -> bool:
+        try:
+            current = self.translation_vault.load()
+            result = TranslationCredentialDialog.ask(parent or self.root, current)
+            if result is False:
+                self.translation_vault.clear()
+                self.translation_service = None
+                self._set_status("翻译密钥已清除")
+                return False
+            if isinstance(result, TranslationCredentials):
+                self.translation_vault.save(result)
+                self.translation_service = None
+                self._set_status("翻译密钥已安全保存")
+                return True
+            return False
+        except Exception as exc:
+            self._show_error(f"翻译密钥设置失败：{exc}")
+            return False
+
+    def _translation_service_for_current_config(self) -> ImageTranslationService:
+        credentials = self.translation_vault.load()
+        if not credentials:
+            raise TranslationError("尚未配置腾讯云翻译密钥。")
+        if self.translation_service is None:
+            provider = TencentTranslationProvider(
+                credentials,
+                region=self.app_config.translation_region,
+            )
+            self.translation_service = ImageTranslationService(
+                provider,
+                ocr_backend=self.ocr_backend,
+                cache_size=self.app_config.translation_cache_size,
+            )
+        return self.translation_service
+
+    def _local_translation_service_for_current_config(self) -> ImageTranslationService:
+        if self.local_translation_service is None:
+            self.local_translation_service = ImageTranslationService(
+                LocalCTranslateProvider(self.local_model_manager),
+                ocr_backend=self.ocr_backend,
+                cache_size=self.app_config.translation_cache_size,
+            )
+        return self.local_translation_service
+
+    def _reset_local_translation_service(self) -> None:
+        self.local_translation_service = None
+
+    def _create_translation_dialog(self, image: Image.Image, title: str):
+        self.translation_upload_confirmed = False
+        self.translation_model_download_confirmed.clear()
+        return ImageTranslationDialog(
+            self.root,
+            image.copy(),
+            translate_func=self._perform_image_translation,
+            source_language=self.app_config.translation_source,
+            target_language=self.app_config.translation_target,
+            translation_mode=self.app_config.translation_mode,
+            quality_mode=self.app_config.translation_quality_mode,
+            title=title,
+            copy_image_func=self.manager.copy_to_clipboard,
+            pin_image_func=lambda value, label: self.pin_manager.pin_image(value, label),
+            confirm_cloud_func=self._confirm_cloud_translation,
+            confirm_local_func=self._confirm_local_translation,
+            on_close=self._on_translation_dialog_close,
+            status_func=self._set_status,
+        )
+
+    def _confirm_cloud_translation(self, mode: str) -> bool:
+        if not self._ensure_translation_credentials(self.translation_dialog or self.root):
+            return False
+        if mode == "privacy":
+            return True
+        if not self.app_config.translation_confirm_upload:
+            return True
+        if self.translation_upload_confirmed:
+            return True
+        accepted = messagebox.askokcancel(
+            "云端图片翻译",
+            "同版式翻译会将当前图片上传到腾讯云机器翻译。是否继续？",
+            parent=self.translation_dialog or self.root,
+        )
+        self.translation_upload_confirmed = bool(accepted)
+        return bool(accepted)
+
+    def _confirm_local_translation(
+        self,
+        source_language: str,
+        target_language: str,
+    ) -> bool:
+        normalized_target = self.local_model_manager._normalize_code(target_language)
+        normalized_source = (
+            ("zh" if normalized_target == "en" else "en")
+            if source_language == "auto"
+            else self.local_model_manager._normalize_code(source_language)
+        )
+        if normalized_source == normalized_target:
+            messagebox.showwarning(
+                "翻译语言相同",
+                "源语言和目标语言不能相同。",
+                parent=self.translation_dialog or self.root,
+            )
+            return False
+        if self.local_model_manager.route_is_installed(
+            normalized_source,
+            normalized_target,
+        ):
+            return True
+        pair = normalized_source, normalized_target
+        if pair in self.translation_model_download_confirmed:
+            return True
+        accepted = messagebox.askokcancel(
+            "下载本地翻译模型",
+            "该语言路径需要下载 1-2 个开源 OPUS-MT 模型，单个模型通常为 "
+            "50-100 MB。\n"
+            "下载完成后可完全断网翻译，也不会产生调用费用。是否继续？",
+            parent=self.translation_dialog or self.root,
+        )
+        if accepted:
+            self.translation_model_download_confirmed.add(pair)
+        return bool(accepted)
+
+    def _on_translation_dialog_close(self) -> None:
+        self.translation_dialog = None
+        self.translation_upload_confirmed = False
+        self.translation_model_download_confirmed.clear()
 
     def toggle_pinned_images(self) -> None:
         self.pin_manager.toggle_all()
@@ -11228,6 +11952,7 @@ class ScreenshotApp:
             on_copy=self._copy_image_direct,
             on_clear=lambda: self._set_status("截图历史已清空"),
             on_ocr=lambda image: self.extract_text_from_image(image, "历史图片"),
+            on_translate=lambda image: self.translate_image(image, "历史图片"),
         )
 
     def open_preferences(self) -> None:
@@ -11254,6 +11979,9 @@ class ScreenshotApp:
                 self.app_config,
                 hotkey_status,
                 self._hotkey_registration_statuses(),
+                translation_vault=self.translation_vault,
+                local_model_manager=self.local_model_manager,
+                local_models_changed_func=self._reset_local_translation_service,
             )
             self.preferences_dialog = dialog
             self.root.wait_window(dialog)
@@ -11283,6 +12011,12 @@ class ScreenshotApp:
                     parent=self.root,
                 )
         self.app_config = new_config
+        self.translation_service = None
+        self.local_translation_service = None
+        self.ocr_backend = ConfigurableOcrBackend(
+            self.app_config.ocr_engine,
+            self.app_config.ocr_quality,
+        )
         ConfigStore.save(self.app_config)
         self.settings.output_dir = Path(self.app_config.output_dir)
         self.settings.auto_save = self.app_config.auto_save
@@ -11638,6 +12372,37 @@ class ScreenshotApp:
             self._restore_window(force_show=True)
             self._show_error(f"框选截图失败：{exc}")
 
+    def _start_translation_region_capture(self) -> None:
+        try:
+            snapshot = self.manager.capture_snapshot()
+            RegionSelectorOverlay(
+                self.root,
+                snapshot.image,
+                on_select=lambda box: self._finish_translation_region(snapshot, box),
+                on_cancel=self._cancel_translation_region,
+                screen_origin=snapshot.geometry.origin,
+            )
+        except Exception as exc:
+            self._restore_window(force_show=True)
+            self._show_error(f"图片翻译选区启动失败：{exc}")
+
+    def _finish_translation_region(self, snapshot: ScreenSnapshot, box: Box) -> None:
+        local_box = snapshot.geometry.to_local_box(box)
+        image = snapshot.image.crop(local_box)
+        origin = (box[0], box[1])
+        self._receive_capture(
+            image,
+            record_history=True,
+            kind="translation-source",
+            allow_auto_save=False,
+            origin=origin,
+        )
+        self.translate_image(image, "框选区域")
+
+    def _cancel_translation_region(self) -> None:
+        self._restore_window()
+        self._set_status("已取消图片翻译")
+
     def _start_long_region_capture(self, settings: LongScreenshotSettings) -> None:
         try:
             snapshot = self.manager.capture_snapshot()
@@ -11796,6 +12561,8 @@ class ScreenshotApp:
             self.copy_last_image()
         elif action == "pin":
             self.pin_manager.pin_image(image, "截图贴图", position=position)
+        elif action == "translate":
+            self.translate_image(image, "截图选区")
 
     def _cancel_region_capture(self) -> None:
         self.pending_screen = None
@@ -11832,6 +12599,8 @@ class ScreenshotApp:
             self.copy_last_image()
         elif action == "pin":
             self.pin_manager.pin_image(image, "白板贴图", position=position)
+        elif action == "translate":
+            self.translate_image(image, "白板")
 
     def _cancel_whiteboard(self) -> None:
         self._restore_window()
@@ -11954,6 +12723,36 @@ class ScreenshotApp:
             self.preview_canvas.winfo_height() // 2,
             image=self.preview_photo,
             anchor=tk.CENTER,
+        )
+
+    def _perform_image_translation(
+        self,
+        image,
+        source,
+        target,
+        mode,
+        quality,
+        progress,
+        cancel_event,
+    ):
+        if mode == "local":
+            service = self._local_translation_service_for_current_config()
+        else:
+            service = self._translation_service_for_current_config()
+            if source == "zt":
+                source = "zh-TW"
+            if target == "zt":
+                target = "zh-TW"
+            if mode == "tencent_smart":
+                mode = "smart"
+        return service.translate(
+            image,
+            target,
+            mode,
+            quality,
+            progress,
+            cancel_event,
+            source_language=source,
         )
 
     def _set_status(self, message: str) -> None:

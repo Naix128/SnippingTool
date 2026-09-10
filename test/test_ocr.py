@@ -9,6 +9,7 @@ import tkinter as tk
 from PIL import Image
 
 import screenshot_app as app
+from screenshot_translation.ocr import DetectedTextLine, RapidOcrUnavailable
 
 
 def sample_document() -> app.OcrDocument:
@@ -42,6 +43,16 @@ class OcrTextFormatterTests(unittest.TestCase):
             app.OcrTextFormatter.normalize_line("图 片 文 字  Hello OCR"),
             "图片文字 Hello OCR",
         )
+
+    def test_line_confidence_averages_known_word_scores(self) -> None:
+        line = app.OcrLineResult(
+            "AB",
+            (
+                app.OcrWordResult("A", (0, 0, 10, 10), 0.4),
+                app.OcrWordResult("B", (10, 0, 20, 10), 0.8),
+            ),
+        )
+        self.assertAlmostEqual(line.confidence, 0.6)
 
 
 class WindowsOcrBackendParsingTests(unittest.TestCase):
@@ -77,6 +88,59 @@ class WindowsOcrBackendParsingTests(unittest.TestCase):
         self.assertLessEqual(prepared.height, image.height)
 
 
+class ConfigurableOcrBackendTests(unittest.TestCase):
+    def test_rapid_result_is_converted_to_existing_document(self) -> None:
+        rapid = Mock()
+        rapid.is_available.return_value = True
+        rapid.recognize.return_value = (
+            DetectedTextLine("Hello", ((2, 3), (42, 3), (42, 18), (2, 18)), 0.9),
+        )
+        subject = app.ConfigurableOcrBackend.__new__(app.ConfigurableOcrBackend)
+        subject.engine = "auto"
+        subject.rapid = rapid
+        subject.windows = Mock()
+
+        document = subject.recognize(Image.new("RGB", (100, 50), "white"))
+
+        self.assertEqual(document.text, "Hello")
+        self.assertEqual(document.lines[0].box, (2, 3, 42, 18))
+        self.assertAlmostEqual(document.lines[0].confidence, 0.9)
+        subject.windows.recognize.assert_not_called()
+
+    def test_auto_mode_falls_back_to_windows(self) -> None:
+        expected = sample_document()
+        subject = app.ConfigurableOcrBackend.__new__(app.ConfigurableOcrBackend)
+        subject.engine = "auto"
+        subject.rapid = Mock()
+        subject.rapid.is_available.return_value = False
+        subject.windows = Mock()
+        subject.windows.recognize.return_value = expected
+        self.assertIs(subject.recognize(Image.new("RGB", (20, 20))), expected)
+
+    def test_explicit_rapid_mode_reports_missing_component(self) -> None:
+        subject = app.ConfigurableOcrBackend.__new__(app.ConfigurableOcrBackend)
+        subject.engine = "rapid"
+        subject.rapid = Mock()
+        subject.rapid.is_available.return_value = False
+        subject.windows = Mock()
+        with self.assertRaises(RapidOcrUnavailable):
+            subject.recognize(Image.new("RGB", (20, 20)))
+
+    def test_explicit_japanese_source_uses_matching_windows_ocr_language(self) -> None:
+        expected = sample_document()
+        with unittest.mock.patch.object(app, "WindowsOcrBackend") as backend_class:
+            backend_class.return_value.recognize.return_value = expected
+            subject = app.ConfigurableOcrBackend.__new__(app.ConfigurableOcrBackend)
+
+            result = subject.recognize_for_language(
+                Image.new("RGB", (20, 20)),
+                "ja",
+            )
+
+        self.assertIs(result, expected)
+        backend_class.assert_called_once_with("ja-JP", strict_language=True)
+
+
 class OcrSelectionModelTests(unittest.TestCase):
     def setUp(self) -> None:
         self.model = app.OcrSelectionModel(sample_document())
@@ -110,6 +174,21 @@ class FakeOcrBackend:
 
 
 class OcrResultDialogTests(unittest.TestCase):
+    def test_close_cancels_startup_callbacks(self) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        dialog = app.OcrResultDialog(
+            root,
+            Image.new("RGB", (80, 40), "white"),
+            backend=FakeOcrBackend(),
+        )
+        jobs = {dialog.render_job, dialog.recognition_job, dialog.sash_job}
+        dialog.close()
+        pending = set(root.tk.call("after", "info"))
+        self.assertTrue(jobs.isdisjoint(pending))
+        root.update()
+        root.destroy()
+
     def test_background_result_populates_editable_text_and_boxes(self) -> None:
         root = tk.Tk()
         root.withdraw()
@@ -148,6 +227,26 @@ class OcrResultDialogTests(unittest.TestCase):
         dialog.clipboard_append = Mock()
         dialog._copy_selected()
         dialog.clipboard_append.assert_called_once_with("图片文字")
+
+        dialog.text.tag_remove(tk.SEL, "1.0", tk.END)
+        dialog.clipboard_append.reset_mock()
+        dialog._copy_text_selection()
+        dialog.clipboard_append.assert_not_called()
+
+        dialog.text.tag_add(tk.SEL, "2.0", "2.5")
+        dialog._copy_text_selection()
+        dialog.clipboard_append.assert_called_once_with("Hello")
+
+        dialog.clipboard_append.reset_mock()
+        dialog.text_context_index = "2.3"
+        dialog._copy_context_line()
+        dialog.clipboard_append.assert_called_once_with("Hello OCR")
+
+        dialog.text_menu.tk_popup = Mock()
+        event = Mock(x=4, y=4, x_root=100, y_root=100)
+        dialog._show_text_menu(event)
+        self.assertEqual(str(dialog.text_menu.entrycget("复制", "state")), "normal")
+        dialog.text_menu.tk_popup.assert_called_once_with(100, 100)
 
         dialog.close()
         root.destroy()
